@@ -84,18 +84,18 @@
 #define BAC_HARD       100   /* hard clamp on center; keeps body on-screen */
 #define BAC_WID         4    /* body half-width (cilia attach point)     */
 #define BAC_HIT         8    /* collision half-box vs the player         */
-#define BAC_COOL        14   /* frames of no-recollide after a bounce    */
 
 /* Amoeba enemy: a slow morphing blob (curves only, plus freckle dots) that
    drifts in the background. Jumping too close electrocutes the player with
    a jolt of lightning. */
-#define AMO_PTS         16   /* outline points (64/16 = clean step of 4)  */
+#define AMO_PTS         12   /* outline points (drawn via the seg12 table) */
 #define AMO_STEP        1    /* drift speed (also moves every other frame) */
 #define AMO_TURN_FRAMES 40   /* frames between random heading nudges       */
 #define AMO_TURN_AT     70   /* start banking inward past this            */
 #define AMO_HARD        94   /* hard clamp on center                       */
-#define AMO_BASE_R      14   /* nominal blob radius                        */
-#define AMO_ZAP_R       20   /* electrocute range (center-to-player box)   */
+#define AMO_BASE_R      10   /* nominal blob radius (25% smaller)          */
+#define AMO_ZAP_R       16   /* electrocute range (center-to-player box)   */
+#define AMO_REBUILD     3    /* rebuild cached outline every (N+1) frames  */
 
 static const int8_t orbit_x[ORBIT_STEPS] = {
     20, 20, 20, 19, 18, 18, 17, 15, 14, 13, 11, 9, 8, 6, 4, 2,
@@ -200,7 +200,6 @@ static int8_t bac_y = 0;
 static int8_t bac_head = 0;      /* swim heading, index into orbit table */
 static uint8_t bac_wiggle = 0;
 static uint8_t bac_turn_t = 0;
-static uint8_t bac_cool = 0;
 
 static uint8_t amo_active = 0;
 static int8_t amo_x = 0;
@@ -212,6 +211,9 @@ static int8_t zap_ax = 0;        /* lightning endpoints captured at death */
 static int8_t zap_ay = 0;
 static int8_t zap_px = 0;
 static int8_t zap_py = 0;
+static int8_t amo_pts_x[AMO_PTS];  /* cached outline offsets from amo center */
+static int8_t amo_pts_y[AMO_PTS];
+static uint8_t amo_cache_valid = 0;
 
 static int8_t scr_x[MAX_SPHERES];
 static int8_t scr_y[MAX_SPHERES];
@@ -707,12 +709,12 @@ static void reset_round(void)
     bac_head = (int8_t)(next_rng() & (ORBIT_STEPS - 1));
     bac_wiggle = 0;
     bac_turn_t = BAC_TURN_FRAMES;
-    bac_cool = 0;
     amo_active = (uint8_t)(level_num >= 4 ? 1 : 0);
     pick_spawn_away(&amo_x, &amo_y, 46);
     amo_head = (int8_t)(next_rng() & (ORBIT_STEPS - 1));
     amo_turn_t = AMO_TURN_FRAMES;
     amo_morph = 0;
+    amo_cache_valid = 0;
     clear_visited();
     clear_edges();
     visited[0] = 1;
@@ -1144,84 +1146,22 @@ static void update_spring(void)
     move_player_spring_back();
 }
 
-/* Bounce the in-flight player off the bacteria: reflect the jump direction
-   about the surface normal (player - bacteria), so it flies off a new way.
-   Falls back to reversing course if reflection would head back into it. */
-static uint8_t deflect_off_bacteria(void)
-{
-    int8_t nx = (int8_t)(player_x - bac_x);
-    int8_t ny = (int8_t)(player_y - bac_y);
-    int8_t odx = jump_dx;
-    int8_t ody = jump_dy;
-    int16_t dot;
-    int16_t nn;
-    int16_t rx;
-    int16_t ry;
-
-    if (nx == 0 && ny == 0) {
-        nx = (int8_t)(-odx);
-        ny = (int8_t)(-ody);
-        if (nx == 0 && ny == 0) {
-            nx = 1;
-        }
-    }
-
-    dot = (int16_t)((int16_t)odx * nx + (int16_t)ody * ny);
-    nn = (int16_t)((int16_t)nx * nx + (int16_t)ny * ny);
-    if (nn == 0) {
-        nn = 1;
-    }
-
-    rx = (int16_t)(odx - (int16_t)((2L * dot * nx) / nn));
-    ry = (int16_t)(ody - (int16_t)((2L * dot * ny) / nn));
-
-    if ((int16_t)((int16_t)rx * nx + (int16_t)ry * ny) < 0) {
-        rx = (int16_t)(-odx);
-        ry = (int16_t)(-ody);
-    }
-
-    if (rx > 120) {
-        rx = 120;
-    } else if (rx < -120) {
-        rx = -120;
-    }
-    if (ry > 120) {
-        ry = 120;
-    } else if (ry < -120) {
-        ry = -120;
-    }
-
-    jump_dx = (int8_t)rx;
-    jump_dy = (int8_t)ry;
-    jump_cx = bac_x;
-    jump_cy = bac_y;
-    jump_clear = 1;
-    jump_committed = 1;
-    jump_pump = 0;
-    mode = MODE_JUMP;
-    bac_cool = BAC_COOL;
-
-    /* nudge clear of the body so we don't immediately re-collide */
-    player_x = (int8_t)(player_x + (nx > 0 ? 4 : (nx < 0 ? -4 : 0)));
-    player_y = (int8_t)(player_y + (ny > 0 ? 4 : (ny < 0 ? -4 : 0)));
-    jump_fx = (int16_t)((int16_t)player_x * 16);
-    jump_fy = (int16_t)((int16_t)player_y * 16);
-
-    return 1;
-}
-
+/* Touching the bacteria mid-jump bursts the player. It has no other effect
+   on the jump: the trajectory is computed identically whether or not the
+   bacteria happens to sit in the path. */
 static uint8_t check_bacteria_collision(void)
 {
     int8_t adx;
     int8_t ady;
 
-    if (!bac_active || bac_cool > 0) {
+    if (!bac_active) {
         return 0;
     }
     adx = (int8_t)abs((int8_t)(player_x - bac_x));
     ady = (int8_t)abs((int8_t)(player_y - bac_y));
     if (adx < BAC_HIT && ady < BAC_HIT) {
-        return deflect_off_bacteria();
+        trigger_death(1);
+        return 1;
     }
     return 0;
 }
@@ -1470,9 +1410,6 @@ static void update_bacteria(void)
     if (!bac_active) {
         return;
     }
-    if (bac_cool > 0) {
-        bac_cool--;
-    }
 
     bac_wiggle = (uint8_t)(bac_wiggle + 5);
 
@@ -1667,6 +1604,10 @@ static void update_play(void)
 static void draw_connections(void)
 {
     uint8_t i;
+    int16_t dx;
+    int16_t dy;
+    int8_t hx;
+    int8_t hy;
 
     if (edge_count == 0) {
         return;
@@ -1676,8 +1617,16 @@ static void draw_connections(void)
     reset0ref();
     moveto_d(scr_y[ln_a[0]], scr_x[ln_a[0]]);
     for (i = 0; i < edge_count; ++i) {
-        draw_line_d((int8_t)(scr_y[ln_b[i]] - scr_y[ln_a[i]]),
-                    (int8_t)(scr_x[ln_b[i]] - scr_x[ln_a[i]]));
+        /* Deltas must be computed in 16-bit: two nuclei (esp. once drift has
+           pushed them apart) can be >127 px apart, which overflows an int8
+           and flips the line's direction. Draw each hop as two halves so
+           every draw_line_d delta stays safely within int8 range. */
+        dx = (int16_t)((int16_t)scr_x[ln_b[i]] - (int16_t)scr_x[ln_a[i]]);
+        dy = (int16_t)((int16_t)scr_y[ln_b[i]] - (int16_t)scr_y[ln_a[i]]);
+        hx = (int8_t)(dx / 2);
+        hy = (int8_t)(dy / 2);
+        draw_line_d(hy, hx);
+        draw_line_d((int8_t)(dy - hy), (int8_t)(dx - hx));
     }
 }
 
@@ -1886,9 +1835,14 @@ static void draw_player(void)
 
     intensity_a(127);
 
-    /* Head down the spine to the hip, then out to the front foot. */
+    /* Head (a small box, beam returns to the head point), then down the
+       spine to the hip and out to the front foot -- all one beam-reset. */
     reset0ref();
     moveto_d(hy, hx);
+    draw_line_d(0, 2);
+    draw_line_d(2, 0);
+    draw_line_d(0, -2);
+    draw_line_d(-2, 0);
     draw_line_d((int8_t)(qy - hy), (int8_t)(qx - hx));
     draw_line_d((int8_t)(ffy - qy), (int8_t)(ffx - qx));
 
@@ -1902,9 +1856,6 @@ static void draw_player(void)
     moveto_d(afy, afx);
     draw_line_d((int8_t)(sy - afy), (int8_t)(sx - afx));
     draw_line_d((int8_t)(aby - sy), (int8_t)(abx - sx));
-
-    /* Head. */
-    draw_dot_abs(hy, hx, 127);
 }
 
 /* Local frame for the bacteria, oriented along its swim heading.
@@ -1989,40 +1940,57 @@ static void draw_bacteria(void)
     }
 }
 
-/* Amoeba: a dim background blob. Each outline point sits at a radius that
-   wobbles with a wave travelling around the body (amo_morph), and whose
-   amplitude slowly breathes, so the whole shape morphs organically. Two
-   freckle dots ride along inside. 16 short segments read as smooth curves. */
+/* Recompute the amoeba outline offsets (relative to its center). Each point
+   sits at a radius that wobbles with a wave travelling around the body
+   (amo_morph) whose amplitude slowly breathes, so the shape morphs
+   organically. All the per-point division lives here; it is called only
+   once every AMO_REBUILD+1 frames (the blob morphs slowly, so a cache this
+   coarse is imperceptible) instead of every frame. */
+static void build_amoeba_pts(void)
+{
+    uint8_t j;
+    uint8_t idx;
+    uint8_t phase;
+    int8_t amp;
+    int8_t rj;
+
+    amp = (int8_t)(2 + (int8_t)((amo_morph >> 3) & 3));    /* 2..5, breathing */
+
+    for (j = 0; j < AMO_PTS; ++j) {
+        idx = seg12[j];
+        phase = (uint8_t)((j * 5 + amo_morph) & (ORBIT_STEPS - 1));
+        rj = (int8_t)(AMO_BASE_R + scale_radial(orbit_x[phase], amp));
+        amo_pts_x[j] = scale_radial(orbit_x[idx], rj);
+        amo_pts_y[j] = scale_radial(orbit_y[idx], rj);
+    }
+}
+
+/* Amoeba: a dim background blob drawn from the cached outline (add-only, no
+   per-frame division). Two freckle dots ride along inside. */
 static void draw_amoeba(void)
 {
     uint8_t j;
-    int8_t amp;
-    int8_t rj;
-    uint8_t phase;
-    uint8_t idx;
     int8_t px, py, nx, ny, x0, y0;
 
     if (!amo_active) {
         return;
     }
 
-    amp = (int8_t)(3 + (int8_t)((amo_morph >> 3) & 3));    /* 3..6, breathing */
+    if (!amo_cache_valid || (amo_morph & AMO_REBUILD) == 0) {
+        build_amoeba_pts();
+        amo_cache_valid = 1;
+    }
 
     intensity_a(45);
     reset0ref();
-    phase = (uint8_t)(amo_morph & (ORBIT_STEPS - 1));
-    rj = (int8_t)(AMO_BASE_R + scale_radial(orbit_x[phase], amp));
-    x0 = (int8_t)(amo_x + scale_radial(orbit_x[0], rj));
-    y0 = (int8_t)(amo_y + scale_radial(orbit_y[0], rj));
+    x0 = (int8_t)(amo_x + amo_pts_x[0]);
+    y0 = (int8_t)(amo_y + amo_pts_y[0]);
     px = x0;
     py = y0;
     moveto_d(py, px);
     for (j = 1; j < AMO_PTS; ++j) {
-        idx = (uint8_t)((j * 4) & (ORBIT_STEPS - 1));
-        phase = (uint8_t)((j * 8 + amo_morph) & (ORBIT_STEPS - 1));
-        rj = (int8_t)(AMO_BASE_R + scale_radial(orbit_x[phase], amp));
-        nx = (int8_t)(amo_x + scale_radial(orbit_x[idx], rj));
-        ny = (int8_t)(amo_y + scale_radial(orbit_y[idx], rj));
+        nx = (int8_t)(amo_x + amo_pts_x[j]);
+        ny = (int8_t)(amo_y + amo_pts_y[j]);
         draw_line_d((int8_t)(ny - py), (int8_t)(nx - px));
         px = nx;
         py = ny;
