@@ -33,7 +33,7 @@
 #define ANIM_MAX 11
 #define SPIN_SPEED 2
 #define ABORT_TRI_R 6
-#define ORBIT_ADVANCE  1   /* 1 step/frame: samples all 64 aim angles, ~1.3s/rev */
+#define ORBIT_ADVANCE  2
 #define JUMP_SPEED_MAX 9
 #define JUMP_SPEED_MIN 3
 #define LAUNCH_RAMP    24
@@ -42,8 +42,7 @@
 #define SPRING_SPEED   9
 #define JUMP_HALF_DIST 50
 #define SCREEN_LIMIT 115
-#define CAPTURE_PAD  16   /* landing forgiveness; absorbs ~11deg orbit-aim steps */
-#define CLEAR_PAD    8    /* tiny margin to detect leaving the launch nucleus     */
+#define CAPTURE_PAD  12
 #define AST_R_MIN 4
 #define AST_R_MAX 24
 #define ORBIT_MARGIN 6
@@ -171,7 +170,7 @@ static int8_t jump_sx = 0;
 static int8_t jump_sy = 0;
 static int8_t jump_orbit_idx = 0;
 static int8_t jump_orbit_r = ORBIT_MARGIN;
-static int16_t jump_travel = 0;  /* 16-bit: a long jump accumulates >127px */
+static int8_t jump_travel = 0;
 static uint8_t jump_clear = 0;
 static uint8_t jump_committed = 0;
 static uint8_t jump_pump = 0;
@@ -262,34 +261,6 @@ static const uint8_t snd_zap[] = {
     0x07, 0x36,                   /* mixer: tone A + noise A on           */
     0x08, 0x10,                   /* amp A follows envelope               */
     0x0b, 0x00, 0x0c, 0x06,       /* medium envelope period               */
-    0x0d, 0x00, 0xff
-};
-/* Launch: a short high pipette "tik" as the player springs off.          */
-static const uint8_t snd_jump[] = {
-    0x00, 0x60, 0x01, 0x00,       /* tone A period ~0x060 (high blip)     */
-    0x07, 0x3e, 0x08, 0x10,
-    0x0b, 0x00, 0x0c, 0x02,       /* very short envelope                  */
-    0x0d, 0x00, 0xff
-};
-/* Aborted jump: a lower, softer "bloop" as the player is pulled back.    */
-static const uint8_t snd_abort[] = {
-    0x00, 0x00, 0x01, 0x03,       /* low tone A period ~0x0300            */
-    0x07, 0x3e, 0x08, 0x10,
-    0x0b, 0x00, 0x0c, 0x03,
-    0x0d, 0x00, 0xff
-};
-/* Level start: a mid "power-on" hum, like a lab instrument warming up.   */
-static const uint8_t snd_level[] = {
-    0x00, 0x00, 0x01, 0x02,       /* tone A period ~0x0200                */
-    0x07, 0x3e, 0x08, 0x10,
-    0x0b, 0x00, 0x0c, 0x05,       /* medium-long envelope                 */
-    0x0d, 0x00, 0xff
-};
-/* Level clear: a bright ringing "ding" that lingers.                     */
-static const uint8_t snd_clear[] = {
-    0x00, 0x30, 0x01, 0x00,       /* high tone A period ~0x030            */
-    0x07, 0x3e, 0x08, 0x10,
-    0x0b, 0x00, 0x0c, 0x09,       /* long envelope -> it rings out        */
     0x0d, 0x00, 0xff
 };
 
@@ -479,11 +450,11 @@ static void get_level_params(uint8_t lvl, LevelParams *p)
     /* Size window tightens and shrinks with level (see randomize). */
     mid = (int8_t)(15 - (int8_t)((lvl - 1) * 2));
     half = (int8_t)(9 - (int8_t)((lvl - 1) * 2));
-    if (mid < 9) {
-        mid = 9;
+    if (mid < 7) {
+        mid = 7;
     }
-    if (half < 2) {
-        half = 2;
+    if (half < 1) {
+        half = 1;
     }
     p->size_mid = mid;
     p->size_half = half;
@@ -495,8 +466,8 @@ static void get_level_params(uint8_t lvl, LevelParams *p)
 
     if (lvl >= 2) {
         uint8_t d = (uint8_t)(3 + (lvl - 2));
-        if (d > 5) {
-            d = 5;
+        if (d > 10) {
+            d = 10;
         }
         p->drift_speed = d;
     } else {
@@ -638,16 +609,6 @@ static int8_t sphere_capture_r(int8_t i)
     return (int8_t)(sp_r[i] + CAPTURE_PAD);
 }
 
-/* Small radius used only to detect that the player has left the launch
-   nucleus. Kept tight (unlike the forgiving capture radius) so landing
-   re-enables almost immediately after launch -- otherwise a big launch
-   nucleus's zone can swallow the whole flight and the player sails past
-   the target with landing suppressed. */
-static int8_t sphere_clear_r(int8_t i)
-{
-    return (int8_t)(sp_r[i] + CLEAR_PAD);
-}
-
 static void clear_visited(void)
 {
     uint8_t i;
@@ -770,7 +731,6 @@ static void start_level(uint8_t lvl)
     reset_round();
     anim_t = 0;
     state = STATE_INTRO;
-    play_sound((void *)snd_level);
 }
 
 static int8_t orbit_idx_from_vector(int8_t ai, int8_t dx, int8_t dy)
@@ -808,13 +768,11 @@ static void begin_jump(void)
     jump_committed = 0;
     jump_pump = 1;
     mode = MODE_JUMP;
-    play_sound((void *)snd_jump);
 }
 
 static void cancel_jump_spring(void)
 {
     mode = MODE_SPRING;
-    play_sound((void *)snd_abort);
 }
 
 static void finish_spring_back(void)
@@ -899,42 +857,21 @@ static uint8_t player_off_screen(void)
                      player_y < -SCREEN_LIMIT || player_y > SCREEN_LIMIT);
 }
 
-/* Distances are computed in 16-bit: a player-to-sphere gap can exceed 127px
-   (long jumps, spread-out boards), and truncating abs() to int8 wraps it
-   negative -- which used to read as "inside the capture box", causing
-   phantom landings on far-away spheres. */
 static uint8_t player_near_sphere(int8_t i)
 {
     int8_t cap = sphere_capture_r(i);
-    int16_t dx = (int16_t)player_x - (int16_t)scr_x[i];
-    int16_t dy = (int16_t)player_y - (int16_t)scr_y[i];
+    int8_t dx = (int8_t)abs(player_x - scr_x[i]);
+    int8_t dy = (int8_t)abs(player_y - scr_y[i]);
 
-    if (dx < 0) {
-        dx = (int16_t)(-dx);
-    }
-    if (dy < 0) {
-        dy = (int16_t)(-dy);
-    }
     return (uint8_t)(dx < cap && dy < cap);
 }
 
 static int8_t sphere_travel_dist(int8_t i)
 {
-    int16_t dx = (int16_t)player_x - (int16_t)scr_x[i];
-    int16_t dy = (int16_t)player_y - (int16_t)scr_y[i];
-    int16_t d;
+    int8_t dx = (int8_t)abs(player_x - scr_x[i]);
+    int8_t dy = (int8_t)abs(player_y - scr_y[i]);
 
-    if (dx < 0) {
-        dx = (int16_t)(-dx);
-    }
-    if (dy < 0) {
-        dy = (int16_t)(-dy);
-    }
-    d = (int16_t)(dx + dy);
-    if (d > 127) {
-        d = 127;
-    }
-    return (int8_t)d;
+    return (int8_t)(dx + dy);
 }
 
 static int8_t nearest_landing_dist(void)
@@ -943,15 +880,8 @@ static int8_t nearest_landing_dist(void)
     int8_t best = 127;
     int8_t d;
 
-    /* Only measure distance to spheres we could actually LAND on. The sphere
-       we launched from (and any already-linked nucleus) can't capture us --
-       check_jump_collisions flies straight through edge_used spheres -- so
-       counting them here used to brake the jump to a crawl as it passed a
-       spent nucleus (the "stall ~30% then drift off screen" bug), then let it
-       re-accelerate and sail off. Braking only for real targets keeps the jump
-       a clean straight line to a landable sphere. */
     for (i = 0; i < sphere_count; ++i) {
-        if (i == current || edge_used(current, i)) {
+        if (i == current) {
             continue;
         }
         d = sphere_travel_dist(i);
@@ -1043,7 +973,6 @@ static void begin_settle(int8_t target)
     }
 
     if (edge_used(current, target)) {
-        fail_reason = 3;
         fail_t = 0;
         state = STATE_FAIL;
         return;
@@ -1142,7 +1071,7 @@ static uint8_t move_player_outward(void)
     int8_t speed = jump_step_speed();
     uint8_t off = move_along_jump_dir(speed);
 
-    jump_travel = (int16_t)(jump_travel + speed);
+    jump_travel = (int8_t)(jump_travel + speed);
     return off;
 }
 
@@ -1192,7 +1121,7 @@ static void check_jump_collisions(void)
     int8_t dy;
 
     if (!jump_clear) {
-        int8_t cap = sphere_clear_r(current);
+        int8_t cap = sphere_capture_r(current);
         dx = (int8_t)abs(player_x - jump_cx);
         dy = (int8_t)abs(player_y - jump_cy);
         if (dx < cap && dy < cap) {
@@ -1203,11 +1132,6 @@ static void check_jump_collisions(void)
 
     for (i = 0; i < sphere_count; ++i) {
         if (i == current) {
-            continue;
-        }
-        /* Already linked to this one: fly straight through it and keep going,
-           rather than dying on a "dead end". Only a NEW nucleus captures. */
-        if (edge_used(current, i)) {
             continue;
         }
         if (player_near_sphere(i)) {
@@ -1343,14 +1267,13 @@ static int8_t player_size_target(void)
     if (mode == MODE_JUMP) {
         int8_t up;
         int8_t down;
-        int16_t jt;
 
         /* Ramp up quickly with distance travelled off the launch pad... */
-        jt = jump_travel;
-        if (jt > JUMP_GROW_DIST) {
-            jt = JUMP_GROW_DIST;
+        grow = jump_travel;
+        if (grow > JUMP_GROW_DIST) {
+            grow = JUMP_GROW_DIST;
         }
-        up = size_ease((int8_t)((jt * 16) / JUMP_GROW_DIST));
+        up = size_ease((int8_t)((int16_t)grow * 16 / JUMP_GROW_DIST));
 
         /* ...then ease back down as we close in on the next asteroid. */
         grow = nearest_landing_dist();
@@ -2157,22 +2080,6 @@ static void draw_hud(void)
     print_str_c(-110, (int8_t)(text_center_x(buf) - TEXT_SHIFT_HUD), buf);
 }
 
-/* Dim "launch direction" tick shown while orbiting: a short line from the
-   player straight out along the current radial, i.e. exactly where a jump
-   would fire. Without it, the running figure faces tangentially and it's
-   easy to launch back toward the nucleus you just came from. */
-static void draw_aim(void)
-{
-    uint8_t idx = (uint8_t)orbit_idx;
-    int8_t ex = (int8_t)(player_x + scale_radial(orbit_x[idx], 16));
-    int8_t ey = (int8_t)(player_y + scale_radial(orbit_y[idx], 16));
-
-    intensity_a(45);
-    reset0ref();
-    moveto_d(player_y, player_x);
-    draw_line_d((int8_t)(ey - player_y), (int8_t)(ex - player_x));
-}
-
 static void draw_play(void)
 {
     draw_amoeba();
@@ -2181,9 +2088,6 @@ static void draw_play(void)
     draw_eye();
     draw_abort_marks();
     draw_bacteria();
-    if (mode == MODE_ORBIT) {
-        draw_aim();
-    }
     draw_player();
     draw_hud();
 }
@@ -2263,8 +2167,6 @@ static void draw_fail(void)
         msg = (char *)"BURST!";
     } else if (fail_reason == 2) {
         msg = (char *)"ZAPPED!";
-    } else if (fail_reason == 3) {
-        msg = (char *)"DEAD END";
     } else {
         msg = (char *)"FELL OFF SLIDE";
     }
@@ -2324,7 +2226,6 @@ int main(void)
             if (anim_t == 0) {
                 win_t = 0;
                 state = STATE_WIN;
-                play_sound((void *)snd_clear);
             } else {
                 anim_t--;
             }
