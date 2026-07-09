@@ -1,10 +1,10 @@
 #include <vectrex/bios.h>
 #include <vectrex/stdlib.h>
 
-#pragma vx_copyright "2026"
-#pragma vx_title_pos 64, -87
-#pragma vx_title_size -8, 80
-#pragma vx_title "PARAMECIUM"
+#pragma vx_copyright "PROK"
+#pragma vx_title_pos 40, -110
+#pragma vx_title_size -8, 70
+#pragma vx_title "P A R A M E C I U M"
 
 /* BIOS default text height/width in system RAM. wait_recal does not restore
    these, so save/restore them around any temporary set_text_size(). */
@@ -28,7 +28,7 @@
 #define MAX_LEVELS  50
 #define MAX_AUTHORED 3
 #define ORBIT_STEPS 64
-#define CIRCLE_SEGS 12
+#define CIRCLE_SEGS 8
 #define ORBIT_RADIUS 20
 #define ANIM_MAX 11
 #define SPIN_SPEED 2
@@ -62,7 +62,6 @@
    right; nudge these screens back left to look centered. */
 #define TEXT_SHIFT_MENU  19
 #define TEXT_SHIFT_TITLE 26
-#define TEXT_SHIFT_HUD   13
 
 /* Animated "eye" obstacle: opens on a random sphere, stays open ~2s, closes.
    Landing on a sphere while its eye is open bursts the player. */
@@ -88,14 +87,14 @@
 /* Amoeba enemy: a slow morphing blob (curves only, plus freckle dots) that
    drifts in the background. Jumping too close electrocutes the player with
    a jolt of lightning. */
-#define AMO_PTS         12   /* outline points (drawn via the seg12 table) */
+#define AMO_PTS         12   /* outline points -- denser = more blob-like */
 #define AMO_STEP        1    /* drift speed (also moves every other frame) */
 #define AMO_TURN_FRAMES 40   /* frames between random heading nudges       */
 #define AMO_TURN_AT     70   /* start banking inward past this            */
 #define AMO_HARD        94   /* hard clamp on center                       */
 #define AMO_BASE_R      10   /* nominal blob radius (25% smaller)          */
 #define AMO_ZAP_R       16   /* electrocute range (center-to-player box)   */
-#define AMO_REBUILD     3    /* rebuild cached outline every (N+1) frames  */
+#define AMO_REBUILD     7    /* rebuild cached outline every (N+1) frames  */
 
 static const int8_t orbit_x[ORBIT_STEPS] = {
     20, 20, 20, 19, 18, 18, 17, 15, 14, 13, 11, 9, 8, 6, 4, 2,
@@ -112,8 +111,12 @@ static const int8_t orbit_y[ORBIT_STEPS] = {
 };
 
 /* Precomputed sample indices into the 64-step orbit table so the draw
-   loop never divides. seg12 = round(i*64/12). */
-static const uint8_t seg12[CIRCLE_SEGS] = {0, 5, 11, 16, 21, 27, 32, 37, 43, 48, 53, 59};
+   loop never divides. 8 evenly spaced samples (i*8) -- enough for a
+   readable circle on Vectrex, ~33% fewer lines than the old 12-seg path. */
+static const uint8_t seg12[CIRCLE_SEGS] = {0, 8, 16, 24, 32, 40, 48, 56};
+
+/* Denser sample set for the amoeba blob (round(i*64/12)). */
+static const uint8_t seg_amo[AMO_PTS] = {0, 5, 11, 16, 21, 27, 32, 37, 43, 48, 53, 59};
 
 static const int8_t l1_x[] = {-60, 0, 62};
 static const int8_t l1_y[] = {-40, 50, -38};
@@ -170,10 +173,15 @@ static int8_t jump_sx = 0;
 static int8_t jump_sy = 0;
 static int8_t jump_orbit_idx = 0;
 static int8_t jump_orbit_r = ORBIT_MARGIN;
-static int8_t jump_travel = 0;
+static int16_t jump_travel = 0;   /* total px travelled this jump; 16-bit so a
+                                     long miss can't overflow and collapse the
+                                     jump speed (the "stall then drift off"
+                                     bug) */
+static int8_t jump_land_dist = 127; /* nearest_landing_dist cached once/frame */
 static uint8_t jump_clear = 0;
 static uint8_t jump_committed = 0;
 static uint8_t jump_pump = 0;
+static uint8_t jump_bounced = 0; /* 1 after first wall bounce this jump */
 static uint8_t jump_armed = 0;
 static int8_t settle_sphere = 0;
 static int8_t settle_tx = 0;
@@ -183,6 +191,23 @@ static int8_t edge_count = 0;
 static int8_t abort_count = 0;
 static int8_t player_size_cur = PLAYER_SIZE_BASE;
 static uint8_t fail_reason = 0;
+
+/* --- TEMP death-cause telemetry (remove once the mid-flight death is found).
+   dbg_site identifies which trigger_death() fired; the rest snapshot state at
+   the instant of death so it can be read straight off the screen. --- */
+static uint8_t dbg_site = 0;
+static int16_t dbg_jt = 0;
+static int8_t dbg_ax = 0;
+static int8_t dbg_ay = 0;
+static uint8_t dbg_ab = 0;
+static uint8_t dbg_mode = 0;
+static uint8_t dbg_minsp = 99;   /* slowest jump speed seen this jump */
+static int8_t dbg_ldmin = 127;   /* nearest_landing_dist when slowest */
+static int8_t dbg_dx = 0;        /* jump direction captured at launch */
+static int8_t dbg_dy = 0;
+static int8_t dbg_sx = 0;        /* launch pixel position */
+static int8_t dbg_sy = 0;
+static uint8_t dbg_frames = 0;   /* frames spent in this jump */
 static uint16_t fail_t = 0;
 static uint16_t death_t = 0;
 static uint8_t anim_t = 0;
@@ -200,6 +225,12 @@ static int8_t bac_y = 0;
 static int8_t bac_head = 0;      /* swim heading, index into orbit table */
 static uint8_t bac_wiggle = 0;
 static uint8_t bac_turn_t = 0;
+static int8_t bac_body_sx[6];    /* cached body screen offsets (heading-only) */
+static int8_t bac_body_sy[6];
+static int8_t bac_cache_head = -1; /* last heading the body cache was built for */
+static int8_t pl_vx[CIRCLE_SEGS]; /* cached player-circle offsets for current r */
+static int8_t pl_vy[CIRCLE_SEGS];
+static int8_t pl_cache_r = -1;
 
 static uint8_t amo_active = 0;
 static int8_t amo_x = 0;
@@ -459,10 +490,9 @@ static void get_level_params(uint8_t lvl, LevelParams *p)
     p->size_mid = mid;
     p->size_half = half;
 
-    /* Hazard/feature ramp: the eye arrives on level 2, the swimming bacteria
-       on level 3, and the nuclei begin to drift (slowly, then faster) from
-       level 2 onward. Level 1 stays a completely static tutorial board. */
-    p->obstacle_count = (uint8_t)(lvl >= 2 ? 1 : 0);
+    /* Hazard ramp: one enemy type at a time. Eye on L2 only; bacteria and
+       amoeba are activated in reset_round for L3 / L4+ respectively. */
+    p->obstacle_count = (uint8_t)(lvl == 2 ? 1 : 0);
 
     if (lvl >= 2) {
         uint8_t d = (uint8_t)(3 + (lvl - 2));
@@ -699,22 +729,33 @@ static void reset_round(void)
     abort_count = 0;
     player_size_cur = PLAYER_SIZE_BASE;
     fail_reason = 0;
+    /* One enemy on screen at a time (keeps level 3+ drawable on the 6809):
+       L2 = eye, L3 = bacteria, L4+ = amoeba. */
     eye_phase = EYE_NONE;
     eye_sphere = -1;
     eye_amt = 0;
     eye_t = EYE_GAP_FRAMES;
     eye_scan = 16;
-    bac_active = (uint8_t)(level_num >= 3 ? 1 : 0);
-    pick_spawn_away(&bac_x, &bac_y, 34);
-    bac_head = (int8_t)(next_rng() & (ORBIT_STEPS - 1));
-    bac_wiggle = 0;
-    bac_turn_t = BAC_TURN_FRAMES;
-    amo_active = (uint8_t)(level_num >= 4 ? 1 : 0);
-    pick_spawn_away(&amo_x, &amo_y, 46);
-    amo_head = (int8_t)(next_rng() & (ORBIT_STEPS - 1));
-    amo_turn_t = AMO_TURN_FRAMES;
-    amo_morph = 0;
+    bac_active = 0;
+    amo_active = 0;
+    bac_cache_head = -1;
     amo_cache_valid = 0;
+
+    if (level_num == 2) {
+        /* eye enabled via cur_params.obstacle_count */
+    } else if (level_num == 3) {
+        bac_active = 1;
+        pick_spawn_away(&bac_x, &bac_y, 34);
+        bac_head = (int8_t)(next_rng() & (ORBIT_STEPS - 1));
+        bac_wiggle = 0;
+        bac_turn_t = BAC_TURN_FRAMES;
+    } else if (level_num >= 4) {
+        amo_active = 1;
+        pick_spawn_away(&amo_x, &amo_y, 46);
+        amo_head = (int8_t)(next_rng() & (ORBIT_STEPS - 1));
+        amo_turn_t = AMO_TURN_FRAMES;
+        amo_morph = 0;
+    }
     clear_visited();
     clear_edges();
     visited[0] = 1;
@@ -767,7 +808,16 @@ static void begin_jump(void)
     jump_clear = 0;
     jump_committed = 0;
     jump_pump = 1;
+    jump_bounced = 0;
     mode = MODE_JUMP;
+
+    dbg_minsp = 99;
+    dbg_ldmin = 127;
+    dbg_dx = jump_dx;
+    dbg_dy = jump_dy;
+    dbg_sx = jump_sx;
+    dbg_sy = jump_sy;
+    dbg_frames = 0;
 }
 
 static void cancel_jump_spring(void)
@@ -790,6 +840,12 @@ static void finish_spring_back(void)
 static void trigger_death(uint8_t reason)
 {
     uint8_t i;
+
+    dbg_jt = jump_travel;
+    dbg_ax = player_x;
+    dbg_ay = player_y;
+    dbg_ab = (uint8_t)abort_count;
+    dbg_mode = mode;
 
     mode = MODE_ORBIT;
     for (i = 0; i < DEATH_PARTS; ++i) {
@@ -860,18 +916,35 @@ static uint8_t player_off_screen(void)
 static uint8_t player_near_sphere(int8_t i)
 {
     int8_t cap = sphere_capture_r(i);
-    int8_t dx = (int8_t)abs(player_x - scr_x[i]);
-    int8_t dy = (int8_t)abs(player_y - scr_y[i]);
+    int16_t dx = (int16_t)player_x - (int16_t)scr_x[i];
+    int16_t dy = (int16_t)player_y - (int16_t)scr_y[i];
 
+    if (dx < 0) {
+        dx = (int16_t)(-dx);
+    }
+    if (dy < 0) {
+        dy = (int16_t)(-dy);
+    }
     return (uint8_t)(dx < cap && dy < cap);
 }
 
 static int8_t sphere_travel_dist(int8_t i)
 {
-    int8_t dx = (int8_t)abs(player_x - scr_x[i]);
-    int8_t dy = (int8_t)abs(player_y - scr_y[i]);
+    int16_t dx = (int16_t)player_x - (int16_t)scr_x[i];
+    int16_t dy = (int16_t)player_y - (int16_t)scr_y[i];
+    int16_t d;
 
-    return (int8_t)(dx + dy);
+    if (dx < 0) {
+        dx = (int16_t)(-dx);
+    }
+    if (dy < 0) {
+        dy = (int16_t)(-dy);
+    }
+    d = (int16_t)(dx + dy);
+    if (d > 127) {
+        d = 127;
+    }
+    return (int8_t)d;
 }
 
 static int8_t nearest_landing_dist(void)
@@ -895,27 +968,23 @@ static int8_t nearest_landing_dist(void)
 static int8_t jump_step_speed(void)
 {
     int8_t speed;
-    int8_t land_dist;
     int8_t vmax = cur_params.jump_speed;
 
     if (vmax < JUMP_SPEED_MIN) {
         vmax = JUMP_SPEED_MIN;
     }
 
+    /* Pure straight-line flight: brief launch ramp up to full speed, then
+       constant speed for the rest of the jump. No "landing brake" -- the
+       trajectory is a straight line and the only thing that ends a jump is a
+       collision (land) or leaving the screen (miss). Slowing down near a
+       sphere the player wasn't going to capture is what made near-misses
+       crawl to a stop and drift off the edge. */
     if (jump_travel < LAUNCH_RAMP) {
         speed = (int8_t)(JUMP_SPEED_MIN +
             ((int16_t)jump_travel * (vmax - JUMP_SPEED_MIN)) / LAUNCH_RAMP);
     } else {
         speed = vmax;
-    }
-
-    land_dist = nearest_landing_dist();
-    if (land_dist < LANDING_RAMP) {
-        int8_t land_speed = (int8_t)(JUMP_SPEED_MIN +
-            ((int16_t)land_dist * (vmax - JUMP_SPEED_MIN)) / LANDING_RAMP);
-        if (land_speed < speed) {
-            speed = land_speed;
-        }
     }
 
     if (speed < JUMP_SPEED_MIN) {
@@ -926,37 +995,70 @@ static int8_t jump_step_speed(void)
 
 /* Advance along the jump direction. Position is accumulated in 1/16-px
    sub-pixel units so the trajectory is a true straight radial line at every
-   speed: the minor axis moves by its exact fractional share instead of being
-   forced to a full pixel per frame (which used to make near-vertical jumps
-   visibly veer sideways). The new position is range-checked BEFORE being
-   stored, so it can never wrap past the screen edge; returns 1 if the step
-   would leave the screen, so the jump can be failed. */
+   speed. Returns 1 only when the step would leave the screen AND the jump
+   has already used its one wall bounce -- first edge hit reflects instead. */
 static uint8_t move_along_jump_dir(int8_t speed)
 {
     int16_t sx;
     int16_t sy;
     int16_t nfx;
     int16_t nfy;
-    int8_t nx;
-    int8_t ny;
+    int16_t px;
+    int16_t py;
+    uint8_t hit_x;
+    uint8_t hit_y;
 
-    sx = (int16_t)(((int16_t)(jump_dx * speed) * 16) / jump_orbit_r);
-    sy = (int16_t)(((int16_t)(jump_dy * speed) * 16) / jump_orbit_r);
+    /* Cast BOTH operands to int16 BEFORE multiplying. CMOC does 8-bit
+       multiply for int8*int8, so |dx|*speed > 127 wraps and reverses the
+       jump direction mid-flight. */
+    sx = (int16_t)(((int16_t)jump_dx * (int16_t)speed * 16) / jump_orbit_r);
+    sy = (int16_t)(((int16_t)jump_dy * (int16_t)speed * 16) / jump_orbit_r);
 
     nfx = (int16_t)(jump_fx + sx);
     nfy = (int16_t)(jump_fy + sy);
-    nx = (int8_t)(nfx / 16);
-    ny = (int8_t)(nfy / 16);
 
-    if (nx < -SCREEN_LIMIT || nx > SCREEN_LIMIT ||
-        ny < -SCREEN_LIMIT || ny > SCREEN_LIMIT) {
-        return 1;
+    px = (int16_t)(nfx / 16);
+    py = (int16_t)(nfy / 16);
+    hit_x = (uint8_t)(px < -SCREEN_LIMIT || px > SCREEN_LIMIT);
+    hit_y = (uint8_t)(py < -SCREEN_LIMIT || py > SCREEN_LIMIT);
+
+    if (hit_x || hit_y) {
+        if (jump_bounced) {
+            return 1;   /* second edge hit = real miss / death */
+        }
+
+        /* One free bounce: reflect the axis that hit, clamp onto the rim,
+           and keep flying so a lined-up sphere can still be landed on. */
+        if (hit_x) {
+            jump_dx = (int8_t)(-jump_dx);
+            if (px > SCREEN_LIMIT) {
+                px = SCREEN_LIMIT;
+            } else {
+                px = (int16_t)(-SCREEN_LIMIT);
+            }
+        }
+        if (hit_y) {
+            jump_dy = (int8_t)(-jump_dy);
+            if (py > SCREEN_LIMIT) {
+                py = SCREEN_LIMIT;
+            } else {
+                py = (int16_t)(-SCREEN_LIMIT);
+            }
+        }
+        jump_fx = (int16_t)(px * 16);
+        jump_fy = (int16_t)(py * 16);
+        player_x = (int8_t)px;
+        player_y = (int8_t)py;
+        jump_bounced = 1;
+        dbg_dx = jump_dx;
+        dbg_dy = jump_dy;
+        return 0;
     }
 
     jump_fx = nfx;
     jump_fy = nfy;
-    player_x = nx;
-    player_y = ny;
+    player_x = (int8_t)px;
+    player_y = (int8_t)py;
     return 0;
 }
 
@@ -968,13 +1070,8 @@ static void begin_settle(int8_t target)
 
     /* Landing on a sphere whose eye is open bursts the player. */
     if (target == eye_sphere && eye_phase == EYE_OPEN) {
+        dbg_site = 1;
         trigger_death(1);
-        return;
-    }
-
-    if (edge_used(current, target)) {
-        fail_t = 0;
-        state = STATE_FAIL;
         return;
     }
 
@@ -990,7 +1087,11 @@ static void begin_settle(int8_t target)
 
 static void finish_settle(void)
 {
-    mark_edge(current, settle_sphere);
+    /* Record the tether for drawing, but never fail on a repeat visit --
+       reusing a link is allowed. */
+    if (!edge_used(current, settle_sphere)) {
+        mark_edge(current, settle_sphere);
+    }
     current = settle_sphere;
     player_x = settle_tx;
     player_y = settle_ty;
@@ -1015,12 +1116,12 @@ static void finish_settle(void)
     }
 }
 
-static int8_t settle_step(int8_t delta, int8_t ad)
+static int8_t settle_step(int16_t delta, int16_t ad)
 {
     int8_t step;
 
     if (ad <= SETTLE_SNAP) {
-        return delta;
+        return (int8_t)delta;
     }
 
     step = (int8_t)(ad / 4);
@@ -1038,15 +1139,15 @@ static int8_t settle_step(int8_t delta, int8_t ad)
 
 static void update_settle(void)
 {
-    int8_t dx;
-    int8_t dy;
-    int8_t adx;
-    int8_t ady;
+    int16_t dx;
+    int16_t dy;
+    int16_t adx;
+    int16_t ady;
 
-    dx = (int8_t)(settle_tx - player_x);
-    dy = (int8_t)(settle_ty - player_y);
-    adx = (int8_t)abs(dx);
-    ady = (int8_t)abs(dy);
+    dx = (int16_t)((int16_t)settle_tx - (int16_t)player_x);
+    dy = (int16_t)((int16_t)settle_ty - (int16_t)player_y);
+    adx = (dx < 0) ? (int16_t)(-dx) : dx;
+    ady = (dy < 0) ? (int16_t)(-dy) : dy;
 
     if (adx <= SETTLE_SNAP && ady <= SETTLE_SNAP) {
         finish_settle();
@@ -1071,7 +1172,13 @@ static uint8_t move_player_outward(void)
     int8_t speed = jump_step_speed();
     uint8_t off = move_along_jump_dir(speed);
 
-    jump_travel = (int8_t)(jump_travel + speed);
+    dbg_frames++;
+    if (jump_travel >= LAUNCH_RAMP && (uint8_t)speed < dbg_minsp) {
+        dbg_minsp = (uint8_t)speed;
+        dbg_ldmin = jump_land_dist;
+    }
+
+    jump_travel = (int16_t)(jump_travel + speed);
     return off;
 }
 
@@ -1079,18 +1186,18 @@ static void move_player_spring_back(void)
 {
     int8_t tx;
     int8_t ty;
-    int8_t dx;
-    int8_t dy;
-    int8_t adx;
-    int8_t ady;
+    int16_t dx;
+    int16_t dy;
+    int16_t adx;
+    int16_t ady;
     int8_t step;
 
     tx = (int8_t)(scr_x[current] + scale_radial(orbit_x[jump_orbit_idx], jump_orbit_r));
     ty = (int8_t)(scr_y[current] + scale_radial(orbit_y[jump_orbit_idx], jump_orbit_r));
-    dx = (int8_t)(tx - player_x);
-    dy = (int8_t)(ty - player_y);
-    adx = (int8_t)abs(dx);
-    ady = (int8_t)abs(dy);
+    dx = (int16_t)((int16_t)tx - (int16_t)player_x);
+    dy = (int16_t)((int16_t)ty - (int16_t)player_y);
+    adx = (dx < 0) ? (int16_t)(-dx) : dx;
+    ady = (dy < 0) ? (int16_t)(-dy) : dy;
 
     if (adx <= SPRING_SPEED && ady <= SPRING_SPEED) {
         finish_spring_back();
@@ -1160,6 +1267,7 @@ static uint8_t check_bacteria_collision(void)
     adx = (int8_t)abs((int8_t)(player_x - bac_x));
     ady = (int8_t)abs((int8_t)(player_y - bac_y));
     if (adx < BAC_HIT && ady < BAC_HIT) {
+        dbg_site = 2;
         trigger_death(1);
         return 1;
     }
@@ -1183,6 +1291,7 @@ static uint8_t check_amoeba_collision(void)
         zap_ay = amo_y;
         zap_px = player_x;
         zap_py = player_y;
+        dbg_site = 3;
         trigger_death(2);
         return 1;
     }
@@ -1191,15 +1300,20 @@ static uint8_t check_amoeba_collision(void)
 
 static void update_jump(void)
 {
+    /* One landing-distance scan per jump frame -- shared by size easing
+       and (debug) stall telemetry. */
+    jump_land_dist = nearest_landing_dist();
+
     if (!jump_committed) {
         if (!button1_held() && !jump_pump) {
             if (jump_travel < JUMP_HALF_DIST) {
+                /* Releasing before the commit distance always reverts to the
+                   launch sphere -- never a death. (Previously a 3rd early
+                   release burst the player, which was not an intended rule and
+                   fired spuriously when a held button momentarily read as
+                   released.) */
                 if (jump_travel > 0) {
-                    if (abort_count >= MAX_ABORTS) {
-                        trigger_death(1);
-                    } else {
-                        cancel_jump_spring();
-                    }
+                    cancel_jump_spring();
                 } else {
                     mode = MODE_ORBIT;
                     update_player_orbit();
@@ -1212,6 +1326,7 @@ static void update_jump(void)
 
     if (button1_held() || jump_committed || jump_pump) {
         if (move_player_outward()) {
+            dbg_site = 5;
             trigger_death(0);
             return;
         }
@@ -1221,6 +1336,7 @@ static void update_jump(void)
     }
 
     if (player_off_screen()) {
+        dbg_site = 6;
         trigger_death(0);
         return;
     }
@@ -1268,15 +1384,17 @@ static int8_t player_size_target(void)
         int8_t up;
         int8_t down;
 
-        /* Ramp up quickly with distance travelled off the launch pad... */
-        grow = jump_travel;
-        if (grow > JUMP_GROW_DIST) {
+        /* Ramp up quickly with distance travelled off the launch pad...
+           (clamp in 16-bit before narrowing so a long jump can't wrap grow) */
+        if (jump_travel > JUMP_GROW_DIST) {
             grow = JUMP_GROW_DIST;
+        } else {
+            grow = (int8_t)jump_travel;
         }
         up = size_ease((int8_t)((int16_t)grow * 16 / JUMP_GROW_DIST));
 
         /* ...then ease back down as we close in on the next asteroid. */
-        grow = nearest_landing_dist();
+        grow = jump_land_dist;
         if (grow > SIZE_SHRINK_DIST) {
             grow = SIZE_SHRINK_DIST;
         }
@@ -1455,13 +1573,22 @@ static void update_bacteria(void)
 
 /* Slowly drift the nuclei, bouncing each one off a soft boundary that keeps
    its whole body (and the player orbiting it) comfortably on screen. Works
-   in 1/16-px sub-pixel units so very slow speeds still move smoothly. */
+   in 1/16-px sub-pixel units so very slow speeds still move smoothly.
+   After the wall bounce, spheres that overlap each other also bounce apart
+   so they never pass through one another. */
 static void update_drift(void)
 {
     int8_t i;
+    int8_t j;
     int8_t lim;
+    int8_t min_sep;
     int16_t nx;
     int16_t ny;
+    int16_t dx;
+    int16_t dy;
+    int16_t adx;
+    int16_t ady;
+    int8_t tmp;
 
     if (cur_params.drift_speed == 0) {
         return;
@@ -1470,8 +1597,8 @@ static void update_drift(void)
     for (i = 0; i < sphere_count; ++i) {
         sp_sx[i] = (int16_t)(sp_sx[i] + sp_dvx[i]);
         sp_sy[i] = (int16_t)(sp_sy[i] + sp_dvy[i]);
-        nx = (int16_t)(sp_sx[i] / 16);
-        ny = (int16_t)(sp_sy[i] / 16);
+        nx = (int16_t)(sp_sx[i] >> 4);
+        ny = (int16_t)(sp_sy[i] >> 4);
 
         lim = (int8_t)(84 - sp_r[i]);
         if (lim < 40) {
@@ -1499,6 +1626,61 @@ static void update_drift(void)
 
         scr_x[i] = (int8_t)nx;
         scr_y[i] = (int8_t)ny;
+    }
+
+    /* Pairwise bounce: if two nuclei overlap (Manhattan approx of radii
+       sum), swap their velocity components along the separation axis and
+       nudge them apart one pixel so they don't stick. Cheap O(n^2) is fine
+       at MAX_SPHERES=6. */
+    for (i = 0; i < sphere_count; ++i) {
+        for (j = (int8_t)(i + 1); j < sphere_count; ++j) {
+            dx = (int16_t)((int16_t)scr_x[i] - (int16_t)scr_x[j]);
+            dy = (int16_t)((int16_t)scr_y[i] - (int16_t)scr_y[j]);
+            adx = (dx < 0) ? (int16_t)(-dx) : dx;
+            ady = (dy < 0) ? (int16_t)(-dy) : dy;
+            min_sep = (int8_t)(sp_r[i] + sp_r[j] + 2);
+            if ((adx + ady) >= (int16_t)min_sep) {
+                continue;
+            }
+
+            /* Reflect: swap velocities so they bounce off each other. */
+            tmp = sp_dvx[i];
+            sp_dvx[i] = sp_dvx[j];
+            sp_dvx[j] = tmp;
+            tmp = sp_dvy[i];
+            sp_dvy[i] = sp_dvy[j];
+            sp_dvy[j] = tmp;
+
+            /* Nudge apart along the dominant axis so they don't re-collide
+               next frame while still overlapping. */
+            if (adx >= ady) {
+                if (dx == 0) {
+                    dx = 1;
+                }
+                if (dx > 0) {
+                    scr_x[i] = (int8_t)(scr_x[i] + 1);
+                    scr_x[j] = (int8_t)(scr_x[j] - 1);
+                } else {
+                    scr_x[i] = (int8_t)(scr_x[i] - 1);
+                    scr_x[j] = (int8_t)(scr_x[j] + 1);
+                }
+            } else {
+                if (dy == 0) {
+                    dy = 1;
+                }
+                if (dy > 0) {
+                    scr_y[i] = (int8_t)(scr_y[i] + 1);
+                    scr_y[j] = (int8_t)(scr_y[j] - 1);
+                } else {
+                    scr_y[i] = (int8_t)(scr_y[i] - 1);
+                    scr_y[j] = (int8_t)(scr_y[j] + 1);
+                }
+            }
+            sp_sx[i] = (int16_t)((int16_t)scr_x[i] * 16);
+            sp_sy[i] = (int16_t)((int16_t)scr_y[i] * 16);
+            sp_sx[j] = (int16_t)((int16_t)scr_x[j] * 16);
+            sp_sy[j] = (int16_t)((int16_t)scr_y[j] * 16);
+        }
     }
 }
 
@@ -1594,6 +1776,7 @@ static void update_play(void)
 
     /* Hard rule: leaving the screen in ANY mode is instant death. */
     if (state == STATE_PLAY && player_off_screen()) {
+        dbg_site = 7;
         trigger_death(0);
     }
 }
@@ -1774,170 +1957,138 @@ static void draw_level_anim(uint8_t k)
     }
 }
 
-/* Local frame for the stick figure. up = radial-outward unit (feet->head),
-   fwd = tangential unit in the orbit-motion direction (facing). Both come
-   from the orbit table (magnitude ORBIT_RADIUS), so a figure point (u,v)
-   with u=forward, v=up maps to screen offset (u*fwd + v*up)*size/FIG_DIV. */
-#define FIG_DIV 80
-static int8_t fig_ux, fig_uy, fig_size, fig_bx, fig_by;
-
-static int8_t fig_x(int8_t u, int8_t v)
-{
-    int16_t o = (int16_t)((int16_t)u * (int8_t)(-fig_uy) + (int16_t)v * fig_ux);
-    return (int8_t)(fig_bx + (int8_t)((o * fig_size) / FIG_DIV));
-}
-
-static int8_t fig_y(int8_t u, int8_t v)
-{
-    int16_t o = (int16_t)((int16_t)u * fig_ux + (int16_t)v * fig_uy);
-    return (int8_t)(fig_by + (int8_t)((o * fig_size) / FIG_DIV));
-}
-
-/* Player as a simple running stick figure: spine along the outward radius
-   (so it "stands" on the sphere), facing the orbit-motion direction, legs
-   and arms splayed in a mid-stride pose. */
+/* Player as a small circle. Outline offsets are cached by radius so we only
+   pay scale_radial when size changes -- draw is then just add + line. */
 static void draw_player(void)
 {
     int8_t size = player_size_cur;
-    uint8_t idx;
-    int8_t hx, hy;      /* head        */
-    int8_t qx, qy;      /* hip         */
-    int8_t sx, sy;      /* shoulder    */
-    int8_t ffx, ffy;    /* front foot  */
-    int8_t fbx, fby;    /* back foot   */
-    int8_t afx, afy;    /* front hand  */
-    int8_t abx, aby;    /* back hand   */
+    int8_t r;
+    uint8_t j;
+    int8_t px, py, nx, ny, x0, y0;
 
     if (size < PLAYER_SIZE_BASE) {
         size = PLAYER_SIZE_BASE;
     }
-
-    if (mode == MODE_JUMP || mode == MODE_SPRING) {
-        idx = (uint8_t)jump_orbit_idx;
-    } else {
-        idx = (uint8_t)orbit_idx;
+    /* Map size 6..14 -> radius ~3..7 so the circle stays readable but small. */
+    r = (int8_t)(size >> 1);
+    if (r < 3) {
+        r = 3;
     }
-    fig_ux = orbit_x[idx];
-    fig_uy = orbit_y[idx];
-    fig_size = size;
 
-    /* Drop the feet onto the surface (player orbits ORBIT_MARGIN above it). */
-    fig_bx = (int8_t)(player_x - (int8_t)(((int16_t)fig_ux * ORBIT_MARGIN) / ORBIT_RADIUS));
-    fig_by = (int8_t)(player_y - (int8_t)(((int16_t)fig_uy * ORBIT_MARGIN) / ORBIT_RADIUS));
-
-    hx = fig_x(0, 6);   hy = fig_y(0, 6);
-    qx = fig_x(0, 3);   qy = fig_y(0, 3);
-    sx = fig_x(0, 5);   sy = fig_y(0, 5);
-    ffx = fig_x(3, 0);  ffy = fig_y(3, 0);
-    fbx = fig_x(-3, 1); fby = fig_y(-3, 1);
-    afx = fig_x(3, 4);  afy = fig_y(3, 4);
-    abx = fig_x(-3, 5); aby = fig_y(-3, 5);
+    if (pl_cache_r != r) {
+        for (j = 0; j < CIRCLE_SEGS; ++j) {
+            pl_vx[j] = scale_radial(orbit_x[seg12[j]], r);
+            pl_vy[j] = scale_radial(orbit_y[seg12[j]], r);
+        }
+        pl_cache_r = r;
+    }
 
     intensity_a(127);
-
-    /* Head (a small box, beam returns to the head point), then down the
-       spine to the hip and out to the front foot -- all one beam-reset. */
     reset0ref();
-    moveto_d(hy, hx);
-    draw_line_d(0, 2);
-    draw_line_d(2, 0);
-    draw_line_d(0, -2);
-    draw_line_d(-2, 0);
-    draw_line_d((int8_t)(qy - hy), (int8_t)(qx - hx));
-    draw_line_d((int8_t)(ffy - qy), (int8_t)(ffx - qx));
-
-    /* Back leg from the hip. */
-    reset0ref();
-    moveto_d(qy, qx);
-    draw_line_d((int8_t)(fby - qy), (int8_t)(fbx - qx));
-
-    /* Arms: front hand through the shoulder to the back hand. */
-    reset0ref();
-    moveto_d(afy, afx);
-    draw_line_d((int8_t)(sy - afy), (int8_t)(sx - afx));
-    draw_line_d((int8_t)(aby - sy), (int8_t)(abx - sx));
+    x0 = (int8_t)(player_x + pl_vx[0]);
+    y0 = (int8_t)(player_y + pl_vy[0]);
+    px = x0;
+    py = y0;
+    moveto_d(py, px);
+    for (j = 1; j < CIRCLE_SEGS; ++j) {
+        nx = (int8_t)(player_x + pl_vx[j]);
+        ny = (int8_t)(player_y + pl_vy[j]);
+        draw_line_d((int8_t)(ny - py), (int8_t)(nx - px));
+        px = nx;
+        py = ny;
+    }
+    draw_line_d((int8_t)(y0 - py), (int8_t)(x0 - px));
 }
 
 /* Local frame for the bacteria, oriented along its swim heading.
    fwd = (bfx, bfy) from the orbit table (magnitude ORBIT_RADIUS),
    side = perpendicular (-bfy, bfx). A body point (a along fwd, b along
    side) maps to screen offset (a*fwd + b*side)/ORBIT_RADIUS from center. */
-static int8_t bfx, bfy, bcx, bcy;
+static int8_t bfx, bfy;
 
-static int8_t bac_px(int8_t a, int8_t b)
+static int8_t bac_ox(int8_t a, int8_t b)
 {
     int16_t o = (int16_t)((int16_t)a * bfx - (int16_t)b * bfy);
-    return (int8_t)(bcx + (int8_t)(o / ORBIT_RADIUS));
+    return (int8_t)(o / ORBIT_RADIUS);
 }
 
-static int8_t bac_py(int8_t a, int8_t b)
+static int8_t bac_oy(int8_t a, int8_t b)
 {
     int16_t o = (int16_t)((int16_t)a * bfy + (int16_t)b * bfx);
-    return (int8_t)(bcy + (int8_t)(o / ORBIT_RADIUS));
+    return (int8_t)(o / ORBIT_RADIUS);
 }
 
-/* Kidney-bean body outline: rounded convex top, with a concave notch in the
-   middle of the bottom edge. +a is the long (swim) axis. */
-#define BAC_BODY_N 10
-static const int8_t bac_body_a[BAC_BODY_N] = {-8, -5, 0, 5, 8,  5,  2,  0, -2, -5};
-static const int8_t bac_body_b[BAC_BODY_N] = { 1,  4, 5, 4, 1, -3, -4, -1, -4, -3};
+/* Compact oval body (6 pts) with a slight belly notch so it still reads as
+   a microbe, not a plain ellipse. +a is the long (swim) axis. */
+#define BAC_BODY_N 6
+static const int8_t bac_body_a[BAC_BODY_N] = {-7, -2, 5, 7, 2, -3};
+static const int8_t bac_body_b[BAC_BODY_N] = { 0,  4, 3, 0,-3, -2};
 
-/* Bacterium: a kidney-bean body with short cilia flicking along each flank. */
+static void rebuild_bac_body(void)
+{
+    uint8_t j;
+    uint8_t h = (uint8_t)(bac_head & (ORBIT_STEPS - 1));
+
+    bfx = orbit_x[h];
+    bfy = orbit_y[h];
+    for (j = 0; j < BAC_BODY_N; ++j) {
+        bac_body_sx[j] = bac_ox(bac_body_a[j], bac_body_b[j]);
+        bac_body_sy[j] = bac_oy(bac_body_a[j], bac_body_b[j]);
+    }
+    bac_cache_head = bac_head;
+}
+
+/* Bacterium: 6-point oval + two flickering cilia drawn as true BIOS dots.
+   One beam-reset for the body; two cheap Dot_d calls for the hairs. Still
+   reads as a swimming microbe, ~half the line work of the old 10-pt bean. */
 static void draw_bacteria(void)
 {
-    uint8_t h;
     uint8_t j;
     int8_t px, py, nx, ny;
     int8_t x0, y0;
+    int8_t hair;
+    int8_t sway;
+    uint8_t h;
 
     if (!bac_active) {
         return;
     }
 
-    h = (uint8_t)(bac_head & (ORBIT_STEPS - 1));
-    bfx = orbit_x[h];
-    bfy = orbit_y[h];
-    bcx = bac_x;
-    bcy = bac_y;
+    if (bac_cache_head != bac_head) {
+        rebuild_bac_body();
+    }
 
     intensity_a(95);
     reset0ref();
-    x0 = bac_px(bac_body_a[0], bac_body_b[0]);
-    y0 = bac_py(bac_body_a[0], bac_body_b[0]);
+    x0 = (int8_t)(bac_x + bac_body_sx[0]);
+    y0 = (int8_t)(bac_y + bac_body_sy[0]);
     px = x0;
     py = y0;
     moveto_d(py, px);
     for (j = 1; j < BAC_BODY_N; ++j) {
-        nx = bac_px(bac_body_a[j], bac_body_b[j]);
-        ny = bac_py(bac_body_a[j], bac_body_b[j]);
+        nx = (int8_t)(bac_x + bac_body_sx[j]);
+        ny = (int8_t)(bac_y + bac_body_sy[j]);
         draw_line_d((int8_t)(ny - py), (int8_t)(nx - px));
         px = nx;
         py = ny;
     }
     draw_line_d((int8_t)(y0 - py), (int8_t)(x0 - px));
 
-    /* Two flicking cilia (one per flank) kept cheap: one beam-reset each. */
-    intensity_a(70);
-    {
-        int8_t hair = (int8_t)(2 + (int8_t)((bac_wiggle >> 3) & 3));
-        int8_t sway = (int8_t)((int8_t)((bac_wiggle >> 2) & 3) - 1);
+    /* Cilia as single points that sway with the wiggle -- still "hairy",
+       but Dot_d is far cheaper than oriented line segments. */
+    h = (uint8_t)(bac_head & (ORBIT_STEPS - 1));
+    bfx = orbit_x[h];
+    bfy = orbit_y[h];
+    hair = (int8_t)(2 + (int8_t)((bac_wiggle >> 3) & 3));
+    sway = (int8_t)((int8_t)((bac_wiggle >> 2) & 3) - 1);
 
-        reset0ref();
-        px = bac_px(4, BAC_WID);
-        py = bac_py(4, BAC_WID);
-        moveto_d(py, px);
-        nx = bac_px((int8_t)(4 + sway), (int8_t)(BAC_WID + hair));
-        ny = bac_py((int8_t)(4 + sway), (int8_t)(BAC_WID + hair));
-        draw_line_d((int8_t)(ny - py), (int8_t)(nx - px));
-
-        reset0ref();
-        px = bac_px(-4, (int8_t)(-BAC_WID));
-        py = bac_py(-4, (int8_t)(-BAC_WID));
-        moveto_d(py, px);
-        nx = bac_px((int8_t)(-4 - sway), (int8_t)(-(BAC_WID + hair)));
-        ny = bac_py((int8_t)(-4 - sway), (int8_t)(-(BAC_WID + hair)));
-        draw_line_d((int8_t)(ny - py), (int8_t)(nx - px));
-    }
+    intensity_a(80);
+    reset0ref();
+    dot_d((int8_t)(bac_y + bac_oy((int8_t)(4 + sway), (int8_t)(BAC_WID + hair))),
+          (int8_t)(bac_x + bac_ox((int8_t)(4 + sway), (int8_t)(BAC_WID + hair))));
+    reset0ref();
+    dot_d((int8_t)(bac_y + bac_oy((int8_t)(-4 - sway), (int8_t)(-(BAC_WID + hair)))),
+          (int8_t)(bac_x + bac_ox((int8_t)(-4 - sway), (int8_t)(-(BAC_WID + hair)))));
 }
 
 /* Recompute the amoeba outline offsets (relative to its center). Each point
@@ -1957,7 +2108,7 @@ static void build_amoeba_pts(void)
     amp = (int8_t)(2 + (int8_t)((amo_morph >> 3) & 3));    /* 2..5, breathing */
 
     for (j = 0; j < AMO_PTS; ++j) {
-        idx = seg12[j];
+        idx = seg_amo[j];
         phase = (uint8_t)((j * 5 + amo_morph) & (ORBIT_STEPS - 1));
         rj = (int8_t)(AMO_BASE_R + scale_radial(orbit_x[phase], amp));
         amo_pts_x[j] = scale_radial(orbit_x[idx], rj);
@@ -1997,8 +2148,12 @@ static void draw_amoeba(void)
     }
     draw_line_d((int8_t)(y0 - py), (int8_t)(x0 - px));
 
-    draw_dot_abs((int8_t)(amo_y + 2), (int8_t)(amo_x + 3), 55);
-    draw_dot_abs((int8_t)(amo_y - 3), (int8_t)(amo_x - 4), 55);
+    /* True single-point freckles via BIOS Dot_d -- no square ticks. */
+    intensity_a(55);
+    reset0ref();
+    dot_d((int8_t)(amo_y + 2), (int8_t)(amo_x + 3));
+    reset0ref();
+    dot_d((int8_t)(amo_y - 3), (int8_t)(amo_x - 4));
 }
 
 /* Jagged lightning bolt between two captured points, flickering each frame
@@ -2026,60 +2181,6 @@ static void draw_lightning(void)
     draw_line_d((int8_t)(zap_py - ay3), (int8_t)(zap_px - ax3));
 }
 
-/* Name shown at the top during play. Defaults to the game name; return a
-   per-level name here later (switch on lvl). */
-static char *level_name(uint8_t lvl)
-{
-    (void)lvl;
-    return (char *)"PARAMECIUM";
-}
-
-static void draw_hud(void)
-{
-    char *name = level_name(level_num);
-    char buf[20];
-    char *status;
-    uint8_t n = 0;
-    uint8_t k = 0;
-
-    zero_beam();
-    print_str_c(110, (int8_t)(text_center_x(name) - TEXT_SHIFT_HUD), name);
-
-    if (mode == MODE_ORBIT) {
-        status = (char *)"JUMP!";
-    } else if (mode == MODE_SPRING) {
-        status = (char *)"SNAP";
-    } else if (mode == MODE_SETTLE) {
-        status = (char *)"JOIN";
-    } else if (jump_committed) {
-        status = (char *)"LOCK";
-    } else if (abort_count >= MAX_ABORTS) {
-        status = (char *)"LAST!";
-    } else {
-        status = (char *)"HOLD";
-    }
-
-    /* "LEVEL N, STATUS", centered along the bottom. */
-    buf[n++] = 'L';
-    buf[n++] = 'E';
-    buf[n++] = 'V';
-    buf[n++] = 'E';
-    buf[n++] = 'L';
-    buf[n++] = ' ';
-    if (level_num >= 10) {
-        buf[n++] = (char)('0' + level_num / 10);
-    }
-    buf[n++] = (char)('0' + level_num % 10);
-    buf[n++] = ',';
-    buf[n++] = ' ';
-    while (status[k] != 0) {
-        buf[n++] = status[k++];
-    }
-    buf[n] = 0;
-
-    print_str_c(-110, (int8_t)(text_center_x(buf) - TEXT_SHIFT_HUD), buf);
-}
-
 static void draw_play(void)
 {
     draw_amoeba();
@@ -2089,36 +2190,57 @@ static void draw_play(void)
     draw_abort_marks();
     draw_bacteria();
     draw_player();
-    draw_hud();
+    /* No HUD text during play -- print_str is one of the heaviest BIOS
+       calls on the Vectrex, and level 3+ already spends the frame budget
+       on spheres + enemies. */
 }
 
 static void draw_title(void)
 {
-    char *line0 = (char *)"PARAMECIUM";
+    /* Spaced letterforms; centered from string length (no fixed left-nudge
+       that was tuned for the old unspaced 10-char name and pulled it off). */
+    char *line0 = (char *)"P A R A M E C I U M";
     char *line1 = (char *)"HOLD TO JUMP";
     char *line2 = (char *)"LAND ON NUCLEI";
     char *line3 = (char *)"TETHER TO SURVIVE";
     char *line4 = (char *)"TO JUMP IS LIFE";
-    char *credit = (char *)"2026 BRIAN JONES";
+    char *credit = (char *)"BRIAN JONES";
     uint8_t save_h;
     uint8_t save_w;
 
-    /* Nudged left to look centered. Game name brighter (bold); rest dimmed. */
+    /* Decorative lab microbe: reuses the in-game bacteria wander/draw with
+       no collision. Spawned once when the title screen opens; reset_round()
+       clears bac_active when play starts. Drawn before text so the copy
+       stays readable. */
+    if (title_t == 0) {
+        bac_active = 1;
+        bac_x = -55;
+        bac_y = 35;
+        bac_head = 10;
+        bac_wiggle = 0;
+        bac_turn_t = BAC_TURN_FRAMES;
+        bac_cache_head = -1;
+    }
+    update_bacteria();
+    draw_bacteria();
+
+    /* Game name brighter (bold); rest dimmed. */
     zero_beam();
     intensity_a(0x7f);
-    print_str_c(62, (int8_t)(text_center_x(line0) - TEXT_SHIFT_TITLE), line0);
+    print_str_c(62, (int8_t)(text_center_x(line0) - 5), line0);
     intensity_a(0x50);
-    print_str_c(15, (int8_t)(text_center_x(line1) - TEXT_SHIFT_TITLE), line1);
-    print_str_c(-5, (int8_t)(text_center_x(line2) - TEXT_SHIFT_TITLE), line2);
-    print_str_c(-25, (int8_t)(text_center_x(line3) - TEXT_SHIFT_TITLE), line3);
-    print_str_c(-50, (int8_t)(text_center_x(line4) - TEXT_SHIFT_TITLE), line4);
+    /* How-to lines: two glyphs (~20) right of the old title-shift nudge. */
+    print_str_c(15, (int8_t)(text_center_x(line1) - (TEXT_SHIFT_TITLE - 20)), line1);
+    print_str_c(-5, (int8_t)(text_center_x(line2) - (TEXT_SHIFT_TITLE - 20)), line2);
+    print_str_c(-25, (int8_t)(text_center_x(line3) - (TEXT_SHIFT_TITLE - 20)), line3);
+    print_str_c(-50, (int8_t)(text_center_x(line4) - (TEXT_SHIFT_TITLE - 20)), line4);
 
     /* Credit line, centered at the bottom in a smaller font. */
     save_h = VEC_TEXT_HEIGHT;
     save_w = VEC_TEXT_WIDTH;
     intensity_a(0x40);
     set_text_size(-6, 50);
-    print_str_c(-100, (int8_t)(-50 - TEXT_SHIFT_TITLE), credit);
+    print_str_c(-100, text_center_x(credit), credit);
     VEC_TEXT_HEIGHT = save_h;
     VEC_TEXT_WIDTH = save_w;
 
@@ -2157,10 +2279,36 @@ static void draw_win(void)
     }
 }
 
+/* TEMP: append a signed decimal to buf (no stdio on Vectrex). */
+static void dbg_append_num(char *buf, uint8_t *pn, int16_t v)
+{
+    uint8_t n = *pn;
+    uint8_t d[6];
+    uint8_t k = 0;
+    uint16_t u;
+
+    if (v < 0) {
+        buf[n++] = '-';
+        u = (uint16_t)(-v);
+    } else {
+        u = (uint16_t)v;
+    }
+    do {
+        d[k++] = (uint8_t)(u % 10);
+        u = (uint16_t)(u / 10);
+    } while (u > 0);
+    while (k > 0) {
+        buf[n++] = (char)('0' + d[--k]);
+    }
+    *pn = n;
+}
+
 static void draw_fail(void)
 {
     char *retry_line = (char *)"TRY AGAIN?";
     char *msg;
+    char dbuf[32];
+    uint8_t n;
 
     update_menu_button_arm(STATE_FAIL);
     if (fail_reason == 1) {
@@ -2172,6 +2320,34 @@ static void draw_fail(void)
     }
     draw_label(25, (int8_t)(text_center_x(msg) - TEXT_SHIFT_MENU), msg);
     draw_label(0, (int8_t)(text_center_x(retry_line) - TEXT_SHIFT_MENU), retry_line);
+
+    /* TEMP death telemetry: site + state snapshot at the instant of death. */
+    n = 0;
+    dbuf[n++] = 'S'; dbg_append_num(dbuf, &n, (int16_t)dbg_site);
+    dbuf[n++] = ' '; dbuf[n++] = 'T'; dbg_append_num(dbuf, &n, dbg_jt);
+    dbuf[n++] = ' '; dbuf[n++] = 'M'; dbg_append_num(dbuf, &n, (int16_t)dbg_mode);
+    dbuf[n++] = ' '; dbuf[n++] = 'A'; dbg_append_num(dbuf, &n, (int16_t)dbg_ab);
+    dbuf[n] = 0;
+    draw_label(-35, (int8_t)(text_center_x(dbuf) - TEXT_SHIFT_MENU), dbuf);
+    n = 0;
+    dbuf[n++] = 'X'; dbg_append_num(dbuf, &n, (int16_t)dbg_ax);
+    dbuf[n++] = ' '; dbuf[n++] = 'Y'; dbg_append_num(dbuf, &n, (int16_t)dbg_ay);
+    dbuf[n] = 0;
+    draw_label(-55, (int8_t)(text_center_x(dbuf) - TEXT_SHIFT_MENU), dbuf);
+    n = 0;
+    dbuf[n++] = 'V'; dbg_append_num(dbuf, &n, (int16_t)dbg_minsp);
+    dbuf[n++] = ' '; dbuf[n++] = 'L'; dbg_append_num(dbuf, &n, (int16_t)dbg_ldmin);
+    dbuf[n++] = ' '; dbuf[n++] = 'F'; dbg_append_num(dbuf, &n, (int16_t)dbg_frames);
+    dbuf[n] = 0;
+    draw_label(-75, (int8_t)(text_center_x(dbuf) - TEXT_SHIFT_MENU), dbuf);
+    n = 0;
+    dbuf[n++] = 'F'; dbuf[n++] = 'R'; dbuf[n++] = 'M';
+    dbg_append_num(dbuf, &n, (int16_t)dbg_sx);
+    dbuf[n++] = ' '; dbg_append_num(dbuf, &n, (int16_t)dbg_sy);
+    dbuf[n++] = ' '; dbuf[n++] = 'D'; dbg_append_num(dbuf, &n, (int16_t)dbg_dx);
+    dbuf[n++] = ' '; dbg_append_num(dbuf, &n, (int16_t)dbg_dy);
+    dbuf[n] = 0;
+    draw_label(-95, (int8_t)(text_center_x(dbuf) - TEXT_SHIFT_MENU), dbuf);
 
     if (menu_button_fire()) {
         reset_menu_button();
