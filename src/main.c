@@ -86,14 +86,18 @@
 
 /* Amoeba enemy: a slow morphing blob (curves only, plus freckle dots) that
    drifts in the background. Jumping too close electrocutes the player with
-   a jolt of lightning. */
-#define AMO_PTS         12   /* outline points -- denser = more blob-like */
+   a jolt of lightning. Sized near the bacteria. Outline uses
+   r(θ) = R + A·cos(kθ + φ) with φ = amo_morph. k=5 + 16 samples keeps it
+   bloblike (k=3 with few points read as a triangle). */
+#define AMO_PTS         16   /* outline samples -- smooth blob, not a triangle */
 #define AMO_STEP        1    /* drift speed (also moves every other frame) */
 #define AMO_TURN_FRAMES 40   /* frames between random heading nudges       */
 #define AMO_TURN_AT     70   /* start banking inward past this            */
 #define AMO_HARD        94   /* hard clamp on center                       */
-#define AMO_BASE_R      10   /* nominal blob radius (25% smaller)          */
-#define AMO_ZAP_R       16   /* electrocute range (center-to-player box)   */
+#define AMO_BASE_R      8    /* R: base radius (~bacteria size)            */
+#define AMO_AMP         2    /* A: lobe "mass" / radial amplitude          */
+#define AMO_LOBES       5    /* k: lobes -- more = organic blob, not tri   */
+#define AMO_ZAP_R       12   /* electrocute range (center-to-player box)   */
 #define AMO_REBUILD     7    /* rebuild cached outline every (N+1) frames  */
 
 static const int8_t orbit_x[ORBIT_STEPS] = {
@@ -115,8 +119,10 @@ static const int8_t orbit_y[ORBIT_STEPS] = {
    readable circle on Vectrex, ~33% fewer lines than the old 12-seg path. */
 static const uint8_t seg12[CIRCLE_SEGS] = {0, 8, 16, 24, 32, 40, 48, 56};
 
-/* Denser sample set for the amoeba blob (round(i*64/12)). */
-static const uint8_t seg_amo[AMO_PTS] = {0, 5, 11, 16, 21, 27, 32, 37, 43, 48, 53, 59};
+/* Even sample set for the amoeba blob (i*64/16 = i*4). */
+static const uint8_t seg_amo[AMO_PTS] = {
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60
+};
 
 static const int8_t l1_x[] = {-60, 0, 62};
 static const int8_t l1_y[] = {-40, 50, -38};
@@ -286,13 +292,16 @@ static const uint8_t snd_eye[] = {
     0x0b, 0x00, 0x0c, 0x02,
     0x0d, 0x00, 0xff
 };
+/* Harsh electrical shock: detuned dual buzz + fast noise, longer decay. */
 static const uint8_t snd_zap[] = {
-    0x00, 0x00, 0x01, 0x02,       /* low buzzy tone A                     */
-    0x06, 0x04,                   /* fast noise (electric crackle)        */
-    0x07, 0x36,                   /* mixer: tone A + noise A on           */
-    0x08, 0x10,                   /* amp A follows envelope               */
-    0x0b, 0x00, 0x0c, 0x06,       /* medium envelope period               */
-    0x0d, 0x00, 0xff
+    0x00, 0x18, 0x01, 0x00,       /* tone A mid-high buzz                  */
+    0x02, 0x1c, 0x03, 0x00,       /* tone B slightly detuned (harsh beat)  */
+    0x06, 0x01,                   /* very fast noise (electric crackle)    */
+    0x07, 0x24,                   /* mixer: tone A+B + noise A+B on        */
+    0x08, 0x10,                   /* amp A follows envelope                */
+    0x09, 0x10,                   /* amp B follows envelope                */
+    0x0b, 0x00, 0x0c, 0x10,       /* longer envelope period (lingering zap)*/
+    0x0d, 0x00, 0xff              /* env shape 0 = one-shot decay          */
 };
 
 static int8_t player_x = 0;
@@ -897,7 +906,7 @@ static void draw_death(void)
 
     draw_connections();
     draw_spheres();
-    if (fail_reason == 2 && death_t < 16) {
+    if (fail_reason == 2 && death_t < 28) {
         draw_lightning();
     }
     for (i = 0; i < DEATH_PARTS; ++i) {
@@ -2091,26 +2100,27 @@ static void draw_bacteria(void)
           (int8_t)(bac_x + bac_ox((int8_t)(-4 - sway), (int8_t)(-(BAC_WID + hair)))));
 }
 
-/* Recompute the amoeba outline offsets (relative to its center). Each point
-   sits at a radius that wobbles with a wave travelling around the body
-   (amo_morph) whose amplitude slowly breathes, so the shape morphs
-   organically. All the per-point division lives here; it is called only
-   once every AMO_REBUILD+1 frames (the blob morphs slowly, so a cache this
-   coarse is imperceptible) instead of every frame. */
+/* Recompute the amoeba outline: r(θ) = R + A·cos(kθ + φ).
+   θ is the sample angle (orbit-table index), φ = amo_morph (phase that
+   rotates the lobes as it drifts), k = AMO_LOBES. orbit_x holds cos scaled
+   to ORBIT_RADIUS, so A·cos is scale_radial(orbit_x[kθ+φ], A). Cached every
+   AMO_REBUILD+1 frames so the morph stays cheap. */
 static void build_amoeba_pts(void)
 {
     uint8_t j;
     uint8_t idx;
     uint8_t phase;
-    int8_t amp;
     int8_t rj;
 
-    amp = (int8_t)(2 + (int8_t)((amo_morph >> 3) & 3));    /* 2..5, breathing */
-
     for (j = 0; j < AMO_PTS; ++j) {
-        idx = seg_amo[j];
-        phase = (uint8_t)((j * 5 + amo_morph) & (ORBIT_STEPS - 1));
-        rj = (int8_t)(AMO_BASE_R + scale_radial(orbit_x[phase], amp));
+        idx = seg_amo[j];                                   /* θ in table steps */
+        phase = (uint8_t)(((uint16_t)AMO_LOBES * idx + amo_morph) &
+                          (ORBIT_STEPS - 1));               /* kθ + φ */
+        rj = (int8_t)(AMO_BASE_R +
+                      scale_radial(orbit_x[phase], AMO_AMP)); /* R + A·cos */
+        if (rj < 2) {
+            rj = 2;
+        }
         amo_pts_x[j] = scale_radial(orbit_x[idx], rj);
         amo_pts_y[j] = scale_radial(orbit_y[idx], rj);
     }
@@ -2132,7 +2142,8 @@ static void draw_amoeba(void)
         amo_cache_valid = 1;
     }
 
-    intensity_a(45);
+    /* Brighter than before so the blob reads clearly against the nuclei. */
+    intensity_a(85);
     reset0ref();
     x0 = (int8_t)(amo_x + amo_pts_x[0]);
     y0 = (int8_t)(amo_y + amo_pts_y[0]);
@@ -2149,36 +2160,71 @@ static void draw_amoeba(void)
     draw_line_d((int8_t)(y0 - py), (int8_t)(x0 - px));
 
     /* True single-point freckles via BIOS Dot_d -- no square ticks. */
-    intensity_a(55);
+    intensity_a(100);
     reset0ref();
-    dot_d((int8_t)(amo_y + 2), (int8_t)(amo_x + 3));
+    dot_d((int8_t)(amo_y + 2), (int8_t)(amo_x + 2));
     reset0ref();
-    dot_d((int8_t)(amo_y - 3), (int8_t)(amo_x - 4));
+    dot_d((int8_t)(amo_y - 2), (int8_t)(amo_x - 2));
 }
 
-/* Jagged lightning bolt between two captured points, flickering each frame
-   for an electric look. Drawn as a single 4-segment polyline. */
+/* Draw one jagged 4-segment bolt from (ax,ay) to (bx,by). */
+static void draw_bolt(int8_t ax, int8_t ay, int8_t bx, int8_t by, int8_t flip)
+{
+    int8_t dx = (int8_t)(bx - ax);
+    int8_t dy = (int8_t)(by - ay);
+    int8_t pxd = (int8_t)(-dy / 3);
+    int8_t pyd = (int8_t)(dx / 3);
+    int8_t s = flip;
+    int8_t x1 = (int8_t)(ax + dx / 4 + (int8_t)(pxd * s));
+    int8_t y1 = (int8_t)(ay + dy / 4 + (int8_t)(pyd * s));
+    int8_t x2 = (int8_t)(ax + dx / 2 - (int8_t)(pxd * s));
+    int8_t y2 = (int8_t)(ay + dy / 2 - (int8_t)(pyd * s));
+    int8_t x3 = (int8_t)(ax + (int8_t)((dx * 3) / 4) + (int8_t)(pxd * s));
+    int8_t y3 = (int8_t)(ay + (int8_t)((dy * 3) / 4) + (int8_t)(pyd * s));
+
+    reset0ref();
+    moveto_d(ay, ax);
+    draw_line_d((int8_t)(y1 - ay), (int8_t)(x1 - ax));
+    draw_line_d((int8_t)(y2 - y1), (int8_t)(x2 - x1));
+    draw_line_d((int8_t)(y3 - y2), (int8_t)(x3 - x2));
+    draw_line_d((int8_t)(by - y3), (int8_t)(bx - x3));
+}
+
+/* Fixed headings for the zap burst (every 45 deg in the 64-step orbit table). */
+static const uint8_t zap_dirs[8] = {0, 8, 16, 24, 32, 40, 48, 56};
+
+/* Fixed radial lightning burst from the amoeba center: bright at impact,
+   fading out over the death frames. Directions do not spin. */
 static void draw_lightning(void)
 {
-    int8_t dx = (int8_t)(zap_px - zap_ax);
-    int8_t dy = (int8_t)(zap_py - zap_ay);
-    int8_t pxd = (int8_t)(-dy / 4);
-    int8_t pyd = (int8_t)(dx / 4);
-    int8_t s = (int8_t)((death_t & 2) ? 1 : -1);
-    int8_t ax1 = (int8_t)(zap_ax + dx / 4 + (int8_t)(pxd * s));
-    int8_t ay1 = (int8_t)(zap_ay + dy / 4 + (int8_t)(pyd * s));
-    int8_t ax2 = (int8_t)(zap_ax + dx / 2 - (int8_t)(pxd * s));
-    int8_t ay2 = (int8_t)(zap_ay + dy / 2 - (int8_t)(pyd * s));
-    int8_t ax3 = (int8_t)(zap_ax + (int8_t)((dx * 3) / 4) + (int8_t)(pxd * s));
-    int8_t ay3 = (int8_t)(zap_ay + (int8_t)((dy * 3) / 4) + (int8_t)(pyd * s));
+    int8_t bright;
+    int8_t len;
+    uint8_t i;
+    int8_t tx;
+    int8_t ty;
 
-    intensity_a(127);
-    reset0ref();
-    moveto_d(zap_ay, zap_ax);
-    draw_line_d((int8_t)(ay1 - zap_ay), (int8_t)(ax1 - zap_ax));
-    draw_line_d((int8_t)(ay2 - ay1), (int8_t)(ax2 - ax1));
-    draw_line_d((int8_t)(ay3 - ay2), (int8_t)(ax3 - ax2));
-    draw_line_d((int8_t)(zap_py - ay3), (int8_t)(zap_px - ax3));
+    /* Fade: full bright at t=0, nearly gone by t=28. */
+    bright = (int8_t)(127 - (int8_t)(death_t * 4));
+    if (bright < 16) {
+        bright = 16;
+    }
+    /* Bolts shrink slightly as they fade. */
+    len = (int8_t)(30 - (int8_t)(death_t / 2));
+    if (len < 12) {
+        len = 12;
+    }
+
+    intensity_a((uint8_t)bright);
+
+    /* Main strike amoeba -> player. */
+    draw_bolt(zap_ax, zap_ay, zap_px, zap_py, 1);
+
+    /* Fixed outward forks from the amoeba center. */
+    for (i = 0; i < 8; ++i) {
+        tx = (int8_t)(zap_ax + scale_radial(orbit_x[zap_dirs[i]], len));
+        ty = (int8_t)(zap_ay + scale_radial(orbit_y[zap_dirs[i]], len));
+        draw_bolt(zap_ax, zap_ay, tx, ty, (int8_t)((i & 1) ? 1 : -1));
+    }
 }
 
 static void draw_play(void)
